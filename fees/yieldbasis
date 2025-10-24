@@ -1,0 +1,172 @@
+import { FetchOptions, SimpleAdapter } from "../../adapters/types";
+import { CHAIN } from "../../helpers/chains";
+
+// YieldBasis LEVAMM contracts for each BTC market
+const LEVAMM_CONTRACTS = {
+  cbBTC: '0xB42e34Bf1f8627189e099ABDB069B9D73B521E4F',
+  WBTC: '0xa25306937dbA98378c32F167588F5Dc17A95c94b',
+  tBTC: '0xb0faaBE84076c6330A9642a6400e87CE4cAec9d4'
+} as const;
+
+// ybBTC token addresses for each market
+const YB_TOKENS = {
+  cbBTC: '0xD6a1147666f6E4d7161caf436d9923D44d901112',
+  WBTC: '0x329239599afB305DA0A2eC69c58F8a6697F9F88d', 
+  tBTC: '0x17E5ed88a7EcB5D47F1c2e1f8FBFFB1a7d99B19c'
+} as const;
+
+// Gauge addresses for staking
+const GAUGE_ADDRESSES = {
+  cbBTC: '0x3dAe83d236b4Ec301A8d0553f8c13Cb9b7925B6a',
+  WBTC: '0x37f45E64935e7B8383D2f034048B32770B04E8bd',
+  tBTC: '0x2a4671fd269dF5B3DA03103c74063dA10D03E23C'
+} as const;
+
+// TokenExchange event from LEVAMM contracts
+const TOKEN_EXCHANGE_EVENT = "event TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought, uint256 fee, uint256 price_oracle)";
+
+interface TokenExchangeLog {
+  buyer: string;
+  sold_id: bigint;
+  tokens_sold: bigint;
+  bought_id: bigint;
+  tokens_bought: bigint;
+  fee: bigint;
+  price_oracle: bigint;
+}
+
+/**
+ * Calculate the dynamic admin fee based on staking ratio
+ * Formula: f_a = 1 - (1 - f_min) * sqrt(1 - s/T)
+ * where:
+ *   f_min = minimum admin fee (0.1 or 10%)
+ *   s = staked amount
+ *   T = total supply
+ */
+function calculateAdminFee(staked: bigint, total: bigint): number {
+  const F_MIN = 0.1; // 10% minimum admin fee
+  
+  if (total === 0n) return F_MIN;
+  
+  const stakingRatio = Number(staked) / Number(total);
+  const adminFee = 1 - (1 - F_MIN) * Math.sqrt(1 - stakingRatio);
+  
+  return adminFee;
+}
+
+const fetch = async (options: FetchOptions) => {
+  const dailyFees = options.createBalances();
+  const dailyRevenue = options.createBalances();
+  const dailySupplySideRevenue = options.createBalances();
+  const dailyHoldersRevenue = options.createBalances();
+
+  // Track total fees collected across all pools
+  let totalFeesCollected = 0n;
+  const poolFees: Array<{ pool: string; fee: bigint }> = [];
+
+  // Fetch TokenExchange events from all three LEVAMM contracts
+  const levammAddresses = Object.values(LEVAMM_CONTRACTS);
+
+  for (const levammAddress of levammAddresses) {
+    const logs: TokenExchangeLog[] = await options.getLogs({
+      target: levammAddress,
+      eventAbi: TOKEN_EXCHANGE_EVENT,
+    });
+
+    let poolFeeTotal = 0n;
+    logs.forEach((log) => {
+      dailyFees.addGasToken(log.fee);
+      totalFeesCollected += log.fee;
+      poolFeeTotal += log.fee;
+    });
+
+    if (poolFeeTotal > 0n) {
+      poolFees.push({ pool: levammAddress, fee: poolFeeTotal });
+    }
+  }
+
+  // Calculate the revenue split for each pool
+  for (const { pool, fee } of poolFees) {
+    // Get the corresponding ybToken and gauge addresses
+    let ybToken: string | undefined;
+    let gaugeAddress: string | undefined;
+    
+    if (pool === LEVAMM_CONTRACTS.cbBTC) {
+      ybToken = YB_TOKENS.cbBTC;
+      gaugeAddress = GAUGE_ADDRESSES.cbBTC;
+    } else if (pool === LEVAMM_CONTRACTS.WBTC) {
+      ybToken = YB_TOKENS.WBTC;
+      gaugeAddress = GAUGE_ADDRESSES.WBTC;
+    } else if (pool === LEVAMM_CONTRACTS.tBTC) {
+      ybToken = YB_TOKENS.tBTC;
+      gaugeAddress = GAUGE_ADDRESSES.tBTC;
+    }
+
+    if (!ybToken || !gaugeAddress) continue;
+
+    try {
+      // Get total supply of ybToken
+      const totalSupply = await options.api.call({
+        target: ybToken,
+        abi: "function totalSupply() view returns (uint256)",
+      });
+
+      // Get staked amount from gauge
+      const stakedAmount = await options.api.call({
+        target: gaugeAddress,
+        abi: "function totalSupply() view returns (uint256)",
+      });
+
+      // Calculate admin fee percentage
+      const adminFeePercentage = calculateAdminFee(
+        BigInt(stakedAmount),
+        BigInt(totalSupply)
+      );
+
+      // 50% of fees are distributed to participants
+      const distributedPortion = fee / 2n;
+      dailyRevenue.addGasToken(distributedPortion);
+
+      // Split the distributed portion based on admin fee
+      const holdersShare = BigInt(
+        Math.floor(Number(distributedPortion) * adminFeePercentage)
+      );
+      const supplySideShare = distributedPortion - holdersShare;
+
+      dailyHoldersRevenue.addGasToken(holdersShare);
+      dailySupplySideRevenue.addGasToken(supplySideShare);
+    } catch (error) {
+      // If we can't fetch the data, fall back to simple 50% split
+      const distributedPortion = fee / 2n;
+      dailyRevenue.addGasToken(distributedPortion);
+      dailySupplySideRevenue.addGasToken(distributedPortion);
+    }
+  }
+
+  return {
+    dailyFees,
+    dailyRevenue,
+    dailySupplySideRevenue,
+    dailyHoldersRevenue,
+  };
+};
+
+const adapter: SimpleAdapter = {
+  version: 2,
+  adapter: {
+    [CHAIN.ETHEREUM]: {
+      fetch,
+      start: '2024-09-13', // YieldBasis launch date
+      meta: {
+        methodology: {
+          Fees: "Trading fees charged on swaps through the YieldBasis leveraged AMM pools (cbBTC, WBTC, tBTC markets). Fees are collected from the TokenExchange events across all LEVAMM contracts.",
+          Revenue: "50% of trading fees are distributed to protocol participants (unstaked ybBTC holders and veYB holders). The other 50% is recycled into rebalancing the pools.",
+          SupplySideRevenue: "Portion of the 50% distributed revenue that goes to unstaked ybBTC holders who provide liquidity. The exact amount depends on the dynamic admin fee, which varies inversely with staking participation. Formula: SupplySide = (1 - AdminFee) * DistributedRevenue.",
+          HoldersRevenue: "Portion of the 50% distributed revenue that goes to veYB holders (vote-locked YB governance token holders). The admin fee dynamically adjusts based on staking ratio using: f_a = 1 - (1 - 0.1) * sqrt(1 - s/T), where s is staked amount and T is total supply. When no one stakes, admin fee is 10%; when everyone stakes, it approaches 100%.",
+        }
+      }
+    }
+  }
+};
+
+export default adapter;
